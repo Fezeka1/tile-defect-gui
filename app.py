@@ -43,7 +43,6 @@ CANDIDATE_MODELS = [
     ("best_baseline_autoencoder.pth", "state_dict"),
 ]
 CALIBRATION_PATH = "calibration.json"
-IMAGE_EXTS = (".png", ".jpg", ".jpeg")
 
 
 @st.cache_resource
@@ -105,47 +104,6 @@ def collect_uploaded_images(uploaded_files):
     return items
 
 
-def collect_folder_images(folder_path):
-    items, error = [], None
-    if not os.path.isdir(folder_path):
-        error = "That folder path doesn't exist."
-        return items, error
-
-    filenames = sorted(f for f in os.listdir(folder_path) if f.lower().endswith(IMAGE_EXTS))
-    if not filenames:
-        error = "No .png/.jpg/.jpeg images found in that folder."
-        return items, error
-
-    for fname in filenames:
-        full_path = os.path.join(folder_path, fname)
-        try:
-            pil_image = Image.open(full_path).convert("RGB")
-        except Exception:
-            continue
-        identity = f"folder:{full_path}:{os.path.getmtime(full_path)}"
-        items.append({"name": fname, "image": pil_image, "identity": identity})
-    return items, error
-
-
-def browse_for_folder():
-    """Opens the OS's native folder-picker dialog. Only works when the app
-    is running on the same machine the browser is viewing it from (which is
-    the normal `streamlit run app.py` local setup)."""
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-
-        root = tk.Tk()
-        root.withdraw()
-        root.wm_attributes("-topmost", 1)
-        path = filedialog.askdirectory(master=root)
-        root.destroy()
-        return path or None
-    except Exception:
-        st.warning("Couldn't open a folder browser here — please paste the path manually instead.")
-        return None
-
-
 def render_result(name, pil_image, recon_np, pixel_error, image_error, latency_ms, threshold):
     is_defective = image_error > threshold
 
@@ -171,7 +129,7 @@ def render_result(name, pil_image, recon_np, pixel_error, image_error, latency_m
 
 def main():
     st.title("🔍 Tile Defect Inspector")
-    st.caption("Upload a tile image (or point at a folder of them) to check for cracks, chips, and blemishes.")
+    st.caption("Upload a tile image to check for cracks, chips, and blemishes.")
 
     model, model_path = load_model()
     if model is None:
@@ -242,34 +200,7 @@ def main():
         accept_multiple_files=True,
     )
 
-    with st.expander("Or load every image from a folder on this computer"):
-        st.session_state.setdefault("folder_path", "")
-
-        def _browse_and_set():
-            chosen = browse_for_folder()
-            if chosen:
-                st.session_state["folder_path"] = chosen
-
-        col_a, col_b = st.columns([4, 1])
-        with col_a:
-            folder_path = st.text_input(
-                "Folder path",
-                placeholder=r"C:\Users\you\Desktop\tile\test\crack",
-                key="folder_path",
-            )
-        with col_b:
-            st.write("")  # vertical spacer to align the button with the text input
-            st.button("📁 Browse...", on_click=_browse_and_set)
-        scan_clicked = st.button("Scan folder")
-
-    new_items, folder_error = [], None
-    if uploaded_files:
-        new_items = collect_uploaded_images(uploaded_files)
-    elif folder_path and scan_clicked:
-        new_items, folder_error = collect_folder_images(folder_path)
-
-    if folder_error:
-        st.error(folder_error)
+    new_items = collect_uploaded_images(uploaded_files) if uploaded_files else []
 
     if new_items:
         run_id = tuple(item["identity"] for item in new_items)
@@ -293,7 +224,7 @@ def main():
             st.session_state.current = {"items": processed, "run_id": run_id}
 
     if not st.session_state.current:
-        st.info("Upload an image, or scan a folder, to run inspection.")
+        st.info("Upload an image to run inspection.")
     else:
         st.divider()
         for item in st.session_state.current["items"]:
@@ -320,4 +251,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
