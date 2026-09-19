@@ -1,40 +1,51 @@
 """
-Streamlit GUI for tile/glass surface defect inspection.
- 
+Streamlit GUI for tile surface defect inspection.
+
 Run with:
     streamlit run app.py
- 
+
 Looks for (in order of preference):
     model_scripted.pt   -- TorchScript-optimized model (faster, see optimize_speed.py)
     optimized_autoencoder.pth -- retrained/optimized checkpoint (see train.py)
     best_baseline_autoencoder.pth -- original baseline checkpoint
- 
+
 And for calibration.json (produced by evaluate.py) to pre-fill the
 recommended anomaly threshold. Everything still works without these --
 sensible defaults are used and clearly labeled as such.
+
+Also looks for icon.png in this folder for the browser tab icon.
 """
 import json
 import os
 import time
- 
+
 import numpy as np
 import streamlit as st
 import torch
 from PIL import Image
- 
+
 from dataset import encoder_transform, target_transform
 from model import load_autoencoder
- 
-st.set_page_config(page_title="Tile/Glass Defect Inspector", layout="wide")
- 
+
+ICON_PATH = "icon.png"
+page_icon = "🔍"
+if os.path.exists(ICON_PATH):
+    try:
+        page_icon = Image.open(ICON_PATH)
+    except Exception:
+        pass
+
+st.set_page_config(page_title="Tile Defect Inspector", page_icon=page_icon, layout="wide")
+
 CANDIDATE_MODELS = [
     ("model_scripted.pt", "torchscript"),
     ("optimized_autoencoder.pth", "state_dict"),
     ("best_baseline_autoencoder.pth", "state_dict"),
 ]
 CALIBRATION_PATH = "calibration.json"
- 
- 
+IMAGE_EXTS = (".png", ".jpg", ".jpeg")
+
+
 @st.cache_resource
 def load_model():
     device = torch.device("cpu")
@@ -47,49 +58,121 @@ def load_model():
                 model = load_autoencoder(path, device=device)
             return model, path
     return None, None
- 
- 
+
+
 @st.cache_data
 def load_calibration():
     if os.path.exists(CALIBRATION_PATH):
         with open(CALIBRATION_PATH) as f:
             return json.load(f)
     return None
- 
- 
-def run_inference(model, pil_image):
+
+
+def run_inference(_model, pil_image):
     encoder_input = encoder_transform(pil_image).unsqueeze(0)
     target = target_transform(pil_image).unsqueeze(0)
- 
+
     start = time.time()
     with torch.no_grad():
-        reconstruction = model(encoder_input)
+        reconstruction = _model(encoder_input)
     latency_ms = (time.time() - start) * 1000
- 
+
     pixel_error = ((reconstruction - target) ** 2).mean(dim=1).squeeze(0).numpy()  # [H, W]
     image_error = float(pixel_error.mean())
- 
+
     recon_np = reconstruction.squeeze(0).permute(1, 2, 0).numpy()
     recon_np = np.clip(recon_np, 0, 1)
- 
+
     return recon_np, pixel_error, image_error, latency_ms
- 
- 
+
+
 def heatmap_overlay(target_pil, pixel_error):
-    import matplotlib.cm as cm
- 
+    import matplotlib
+
     target_np = np.array(target_pil.resize((128, 128))) / 255.0
     normed = (pixel_error - pixel_error.min()) / (pixel_error.max() - pixel_error.min() + 1e-8)
-    heat = cm.get_cmap("inferno")(normed)[..., :3]
+    heat = matplotlib.colormaps["inferno"](normed)[..., :3]
     overlay = 0.55 * target_np + 0.45 * heat
     return np.clip(overlay, 0, 1)
- 
- 
+
+
+def collect_uploaded_images(uploaded_files):
+    items = []
+    for f in uploaded_files:
+        pil_image = Image.open(f).convert("RGB")
+        identity = f"upload:{f.name}:{f.size}"
+        items.append({"name": f.name, "image": pil_image, "identity": identity})
+    return items
+
+
+def collect_folder_images(folder_path):
+    items, error = [], None
+    if not os.path.isdir(folder_path):
+        error = "That folder path doesn't exist."
+        return items, error
+
+    filenames = sorted(f for f in os.listdir(folder_path) if f.lower().endswith(IMAGE_EXTS))
+    if not filenames:
+        error = "No .png/.jpg/.jpeg images found in that folder."
+        return items, error
+
+    for fname in filenames:
+        full_path = os.path.join(folder_path, fname)
+        try:
+            pil_image = Image.open(full_path).convert("RGB")
+        except Exception:
+            continue
+        identity = f"folder:{full_path}:{os.path.getmtime(full_path)}"
+        items.append({"name": fname, "image": pil_image, "identity": identity})
+    return items, error
+
+
+def browse_for_folder():
+    """Opens the OS's native folder-picker dialog. Only works when the app
+    is running on the same machine the browser is viewing it from (which is
+    the normal `streamlit run app.py` local setup)."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.wm_attributes("-topmost", 1)
+        path = filedialog.askdirectory(master=root)
+        root.destroy()
+        return path or None
+    except Exception:
+        st.warning("Couldn't open a folder browser here — please paste the path manually instead.")
+        return None
+
+
+def render_result(name, pil_image, recon_np, pixel_error, image_error, latency_ms, threshold):
+    is_defective = image_error > threshold
+
+    st.subheader(name)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.image(pil_image, caption="Original", use_container_width=True)
+    with col2:
+        overlay = heatmap_overlay(pil_image, pixel_error)
+        st.image(overlay, caption="Anomaly heatmap", use_container_width=True)
+    with col3:
+        verdict = "DEFECTIVE" if is_defective else "GOOD"
+        color = "red" if is_defective else "green"
+        st.markdown(f"### :{color}[{verdict}]")
+        margin = abs(image_error - threshold) / threshold * 100
+        st.caption(f"{margin:.0f}% {'above' if is_defective else 'below'} the flagging threshold")
+        with st.expander("Technical details"):
+            st.image(recon_np, caption="Model's expected reconstruction", width=200)
+            st.metric("Reconstruction error", f"{image_error:.5f}")
+            st.metric("Threshold", f"{threshold:.5f}")
+            st.metric("Inference latency", f"{latency_ms:.1f} ms")
+
+
 def main():
-    st.title("Tile / Glass Surface Defect Inspector")
-    st.caption("Autoencoder-based anomaly detection — trained only on defect-free surfaces; "
-               "defects are flagged via reconstruction error.")
- 
+    st.title("🔍 Tile Defect Inspector")
+    st.caption("Upload a tile image (or point at a folder of them) to check for cracks, chips, and blemishes.")
+
     model, model_path = load_model()
     if model is None:
         st.error(
@@ -97,71 +180,144 @@ def main():
             f"{[c[0] for c in CANDIDATE_MODELS]} in this directory."
         )
         return
- 
+
     calibration = load_calibration()
-    default_threshold = 0.01
     roc_auc_note = None
+
+    # Youden's J gives the best balance of catching defects vs. false alarms
+    # (see calibration.json comparison) -- it's the sane default for an
+    # end user, unlike the overly conservative percentile threshold.
+    default_threshold = 0.01
+    sensitivity_presets = {}
     if calibration:
-        default_threshold = calibration.get("recommended_threshold", default_threshold)
         roc_auc_note = calibration.get("image_level_roc_auc")
- 
+        t = calibration["thresholds"]
+        sensitivity_presets = {
+            "Lenient (flags fewer tiles, may miss subtle defects)": t["supervised_f1_optimal"],
+            "Balanced (recommended)": t["supervised_youden_j"],
+            "Strict (flags more tiles, more false alarms)": t["unsupervised_percentile"],
+        }
+        default_threshold = t["supervised_youden_j"]
+
     with st.sidebar:
-        st.subheader("Model")
-        st.write(f"Loaded: `{model_path}`")
-        if roc_auc_note is not None:
-            st.write(f"Held-out image-level ROC-AUC: **{roc_auc_note:.3f}**")
- 
-        st.subheader("Anomaly threshold")
-        threshold = st.slider(
-            "Reconstruction-error threshold",
-            min_value=0.0, max_value=0.05,
-            value=float(default_threshold), step=0.0005, format="%.4f",
-        )
-        if calibration:
-            st.caption(
-                f"Calibrated from held-out good images "
-                f"(95th percentile = {calibration['thresholds']['unsupervised_percentile']:.4f}). "
-                "Lower = more sensitive (more false alarms). "
-                "Higher = fewer false alarms (may miss subtle defects)."
+        st.subheader("Sensitivity")
+        if sensitivity_presets:
+            choice = st.radio(
+                "How strict should defect flagging be?",
+                options=list(sensitivity_presets.keys()),
+                index=1,  # Balanced
+                label_visibility="collapsed",
             )
+            threshold = sensitivity_presets[choice]
         else:
-            st.caption("No calibration.json found — using an uncalibrated default. "
-                       "Run evaluate.py first for a data-driven threshold.")
- 
+            threshold = default_threshold
+
+        with st.expander("Advanced (exact threshold)"):
+            threshold = st.slider(
+                "Reconstruction-error threshold",
+                min_value=0.0, max_value=0.02,
+                value=float(threshold), step=0.0005, format="%.4f",
+            )
+            st.caption("Lower = more sensitive. Only adjust this if you know what you're doing "
+                       "-- the presets above are calibrated from real defect examples.")
+
+        with st.expander("About this tool"):
+            st.write(f"Model file: `{model_path}`")
+            if roc_auc_note is not None:
+                st.write(f"Validation accuracy score (ROC-AUC): {roc_auc_note:.2f} (1.0 = perfect)")
+            else:
+                st.caption("No calibration data found — using an uncalibrated default sensitivity.")
+            st.caption("Trained only on defect-free tile images. Defects are flagged when the "
+                       "model's reconstruction of an image differs enough from the original.")
+
+    # -- Session state: current result(s) shown up front, everything else in History --
+    if "history" not in st.session_state:
+        st.session_state.history = []       # compact past entries, most recent first
+    if "current" not in st.session_state:
+        st.session_state.current = None     # {"items": [...], "run_id": ...}
+
     uploaded_files = st.file_uploader(
-        "Upload one or more tile/glass images",
+        "Upload one or more tile images",
         type=["png", "jpg", "jpeg"],
         accept_multiple_files=True,
     )
- 
-    if not uploaded_files:
-        st.info("Upload an image to run inspection.")
-        return
- 
-    for uploaded_file in uploaded_files:
-        pil_image = Image.open(uploaded_file).convert("RGB")
-        recon_np, pixel_error, image_error, latency_ms = run_inference(model, pil_image)
-        is_defective = image_error > threshold
- 
+
+    with st.expander("Or load every image from a folder on this computer"):
+        st.session_state.setdefault("folder_path", "")
+
+        def _browse_and_set():
+            chosen = browse_for_folder()
+            if chosen:
+                st.session_state["folder_path"] = chosen
+
+        col_a, col_b = st.columns([4, 1])
+        with col_a:
+            folder_path = st.text_input(
+                "Folder path",
+                placeholder=r"C:\Users\you\Desktop\tile\test\crack",
+                key="folder_path",
+            )
+        with col_b:
+            st.write("")  # vertical spacer to align the button with the text input
+            st.button("📁 Browse...", on_click=_browse_and_set)
+        scan_clicked = st.button("Scan folder")
+
+    new_items, folder_error = [], None
+    if uploaded_files:
+        new_items = collect_uploaded_images(uploaded_files)
+    elif folder_path and scan_clicked:
+        new_items, folder_error = collect_folder_images(folder_path)
+
+    if folder_error:
+        st.error(folder_error)
+
+    if new_items:
+        run_id = tuple(item["identity"] for item in new_items)
+        if run_id != (st.session_state.current or {}).get("run_id"):
+            # A genuinely new upload/scan -- move the previous "current" into
+            # history, then compute fresh results for this batch.
+            if st.session_state.current:
+                for old_item in st.session_state.current["items"]:
+                    st.session_state.history.insert(0, {
+                        "name": old_item["name"],
+                        "thumb": old_item["image"].copy().resize((64, 64)),
+                        "image_error": old_item["image_error"],
+                    })
+                st.session_state.history = st.session_state.history[:200]
+
+            processed = []
+            for item in new_items:
+                recon_np, pixel_error, image_error, latency_ms = run_inference(model, item["image"])
+                processed.append({**item, "recon_np": recon_np, "pixel_error": pixel_error,
+                                   "image_error": image_error, "latency_ms": latency_ms})
+            st.session_state.current = {"items": processed, "run_id": run_id}
+
+    if not st.session_state.current:
+        st.info("Upload an image, or scan a folder, to run inspection.")
+    else:
         st.divider()
-        st.subheader(uploaded_file.name)
- 
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.image(pil_image, caption="Original", use_container_width=True)
-        with col2:
-            st.image(recon_np, caption="Reconstruction", use_container_width=True)
-        with col3:
-            overlay = heatmap_overlay(pil_image, pixel_error)
-            st.image(overlay, caption="Anomaly heatmap", use_container_width=True)
-        with col4:
-            verdict = "DEFECTIVE" if is_defective else "GOOD"
-            color = "red" if is_defective else "green"
-            st.markdown(f"### :{color}[{verdict}]")
-            st.metric("Reconstruction error", f"{image_error:.5f}")
-            st.metric("Threshold", f"{threshold:.5f}")
-            st.metric("Inference latency", f"{latency_ms:.1f} ms")
- 
- 
+        for item in st.session_state.current["items"]:
+            render_result(item["name"], item["image"], item["recon_np"], item["pixel_error"],
+                          item["image_error"], item["latency_ms"], threshold)
+            st.divider()
+
+    if st.session_state.history:
+        with st.expander(f"History ({len(st.session_state.history)} previous images)"):
+            if st.button("Clear history"):
+                st.session_state.history = []
+                st.rerun()
+            for entry in st.session_state.history:
+                is_defective = entry["image_error"] > threshold
+                hcol1, hcol2, hcol3 = st.columns([1, 3, 2])
+                with hcol1:
+                    st.image(entry["thumb"], width=64)
+                with hcol2:
+                    st.write(entry["name"])
+                with hcol3:
+                    color = "red" if is_defective else "green"
+                    st.markdown(f":{color}[{'DEFECTIVE' if is_defective else 'GOOD'}]")
+
+
 if __name__ == "__main__":
     main()
+    
